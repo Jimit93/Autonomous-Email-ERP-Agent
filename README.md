@@ -68,29 +68,9 @@ if "quote" in email and "Mavic" in email:
 | **Dashboard** | Chart.js + HTML/CSS |
 | **Async** | asyncio |
 
----
 
-## 🎭 Bonus: Random Joke Generator
 
-Includes a standalone **Random Joke Generator** using 4 external APIs:
 
-**Features:**
-- 🎭 General jokes (JokeAPI)
-- 💻 Programming jokes (Official Joke API)
-- 🥋 Chuck Norris jokes
-- 👨‍🦱 Dad jokes
-- 💾 Save jokes to JSON
-- 📊 Interactive menu
-- ⭐ Rate jokes (1-5 stars)
-
-**Usage:**
-```bash
-python joke_generator.py
-```
-
----
-
-## 📊 Sales Pipeline
 
 ```
 Customer Email
