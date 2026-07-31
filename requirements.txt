@@ -1,0 +1,10 @@
+nest-asyncio
+pydantic
+weasyprint
+langgraph
+langchain-google-genai
+langchain-core
+matplotlib
+python-dotenv
+requests
+scikit-learn
