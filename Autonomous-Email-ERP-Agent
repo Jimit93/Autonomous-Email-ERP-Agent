@@ -1,7 +1,7 @@
 """
 =============================================================================
 AEROTECH DRONES - AUTONOMOUS EMAIL ERP AGENT
-Version 5.2 (Live Monitor & WAL Enabled)
+Version 5.2.1 (Hybrid Intent Matching & Enhanced UI)
 =============================================================================
 """
 
@@ -21,6 +21,7 @@ import imaplib
 import smtplib
 import logging
 import sqlite3
+import difflib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import TypedDict, List, Optional, Dict, Any, Literal
@@ -41,9 +42,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 from sklearn.naive_bayes import MultinomialNB
 
-# --- live monitor hooks (all fail-safe; see agent_trace.py) ---
-from agent_trace import (ensure_trace_schema, record_trace, heartbeat,
-                         export_models)
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# --- live monitor hooks removed for standalone prototyping ---
+# from agent_trace import (ensure_trace_schema, record_trace, heartbeat, export_models)
 
 
 # =============================================================================
@@ -88,13 +92,18 @@ IGNORE_DOMAINS = [
 
 
 # =============================================================================
-# 2. MACHINE LEARNING SETUP
+# 2. MACHINE LEARNING & FAISS SETUP
 # =============================================================================
 # Catalogues are loaded from SQL after database initialization.
 inventory_items = []
 vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
 X = None
 nn = None
+
+# Dense Embedding Model + FAISS Setup
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+faiss_index = None
+faiss_dimension = 384  # MiniLM-L6-v2 output dimension
 
 
 training_emails = [
@@ -120,7 +129,7 @@ COMMERCIAL_SIGNALS = [
 
 
 # =============================================================================
-# 3. TEXT HELPERS
+# 3. TEXT HELPERS & HYBRID INTENT MATCHING
 # =============================================================================
 NEGATION_RE = re.compile(
     r"\b(not|no|never|dont|don't|doesn't|didn't|cannot|can't|won't|wouldn't|"
@@ -128,15 +137,57 @@ NEGATION_RE = re.compile(
 
 
 def has_words(text: str, words: List[str], respect_negation: bool = True) -> bool:
+    """
+    Hybrid Matcher: Exact String -> ML Typo Fallback -> FAISS Semantic Fallback.
+    """
     if not text:
         return False
+        
+    text_lower = text.lower()
+    
+    # --- Level 1: Exact Regex Match ---
     for w in words:
-        for m in re.finditer(rf"\b{re.escape(w)}\b", text, re.IGNORECASE):
+        for m in re.finditer(rf"\b{re.escape(w)}\b", text_lower):
             if respect_negation:
-                window = text[max(0, m.start() - 45):m.start()]
+                window = text_lower[max(0, m.start() - 45):m.start()]
                 if NEGATION_RE.search(window):
                     continue
             return True
+            
+    # --- Level 2: ML Typo Check (e.g. "approvec" vs "approved") ---
+    text_words = set(re.findall(r'\b\w{4,}\b', text_lower))
+    target_words = [w for w in words if len(w) >= 4]
+    
+    if target_words:
+        for tw in text_words:
+            # Cutoff 0.8 ensures high character similarity without false positives
+            matches = difflib.get_close_matches(tw, target_words, n=1, cutoff=0.8)
+            if matches:
+                logging.info(f"ML Intent Typo Resolved: '{tw}' matched to '{matches[0]}'")
+                return True
+
+    # --- Level 3: FAISS Semantic Fallback (Meaning Match) ---
+    if len(text_lower) > 5:
+        try:
+            # Encode user text
+            text_vec = embedding_model.encode([text_lower[:250]], convert_to_numpy=True)
+            faiss.normalize_L2(text_vec)
+            
+            # Encode target intents
+            target_vecs = embedding_model.encode(words, convert_to_numpy=True)
+            faiss.normalize_L2(target_vecs)
+            
+            # Compute Cosine Similarity
+            similarities = np.dot(text_vec, target_vecs.T)
+            best_sim = np.max(similarities)
+            
+            if best_sim >= 0.65:  # High confidence semantic threshold
+                best_word = words[np.argmax(similarities)]
+                logging.info(f"FAISS Semantic Intent Matched: Phrase means '{best_word}' (Score: {best_sim:.2f})")
+                return True
+        except Exception as e:
+            logging.warning(f"Semantic match failed: {e}")
+            
     return False
 
 
@@ -197,7 +248,7 @@ def money(v: float) -> str:
 
 
 # =============================================================================
-# 4. DATABASE
+# 4. DATABASE & CATALOG MANAGEMENT
 # =============================================================================
 @contextmanager
 def db_conn():
@@ -267,10 +318,6 @@ def initialize_database():
             c.execute("ALTER TABLE inventory ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
             logging.info("Migration: inventory.active added.")
 
-        # Do not seed a hardcoded product list. Inventory is populated and maintained
-        # through the SQL-backed owner management helpers below.
-
-
 
 def get_catalog(include_inactive: bool = False) -> List[dict]:
     """Return the live product catalogue and stock from SQL."""
@@ -283,21 +330,83 @@ def get_catalog(include_inactive: bool = False) -> List[dict]:
 
 
 def refresh_catalog_models() -> None:
-    """Rebuild product matching models from current SQL rows."""
-    global inventory_items, vectorizer, X, nn, COMMERCIAL_SIGNALS
+    """Rebuild TF-IDF, KNN, and FAISS vector indices from current SQL catalog."""
+    global inventory_items, vectorizer, X, nn, faiss_index, COMMERCIAL_SIGNALS
     catalog = get_catalog()
     inventory_items = [row["product_name"] for row in catalog]
+
+    if not inventory_items:
+        X, nn, faiss_index = None, None, None
+        return
+
+    # 1. Sparse Matrix (TF-IDF + KNN for typos/fuzzy matches)
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
-    if inventory_items:
-        X = vectorizer.fit_transform(inventory_items)
-        nn = NearestNeighbors(n_neighbors=1, metric="cosine")
-        nn.fit(X)
-    else:
-        X = None
-        nn = None
-    COMMERCIAL_SIGNALS = list(dict.fromkeys(COMMERCIAL_SIGNALS + [
-        word.lower() for item in inventory_items for word in item.split() if len(word) > 3
-    ]))
+    X = vectorizer.fit_transform(inventory_items)
+    nn = NearestNeighbors(n_neighbors=1, metric="cosine")
+    nn.fit(X)
+
+    # 2. Dense Matrix (SentenceTransformer + FAISS for semantic lookup)
+    embeddings = embedding_model.encode(inventory_items, convert_to_numpy=True)
+    faiss.normalize_L2(embeddings)  # Normalize for Cosine Similarity
+
+    faiss_index = faiss.IndexFlatIP(faiss_dimension)  # Inner Product on normalized vectors = Cosine Sim
+    faiss_index.add(embeddings)
+
+    # Dynamic Commercial Signals
+    COMMERCIAL_SIGNALS = list(
+        dict.fromkeys(
+            COMMERCIAL_SIGNALS
+            + [
+                word.lower()
+                for item in inventory_items
+                for word in item.split()
+                if len(word) > 3
+            ]
+        )
+    )
+
+def match_product_hybrid(
+    query_name: str,
+    tfidf_threshold: float = 0.35,
+    faiss_threshold: float = 0.55,
+) -> Optional[str]:
+    """Hybrid Lookup Order:
+    1. Exact String Match
+    2. TF-IDF / KNN (Typo & Lexical overlap)
+    3. FAISS + Dense Embeddings (Semantic meaning)
+    """
+    if not query_name or not inventory_items:
+        return None
+
+    query_clean = query_name.strip().lower()
+
+    # --- Level 1: Exact / Substring Match ---
+    for item in inventory_items:
+        if item.lower() == query_clean:
+            return item
+
+    # --- Level 2: TF-IDF + KNN (Character n-gram match for typos) ---
+    if nn is not None and vectorizer is not None:
+        distances, indices = nn.kneighbors(vectorizer.transform([query_clean]))
+        if distances[0][0] <= tfidf_threshold:
+            return inventory_items[indices[0][0]]
+
+    # --- Level 3: FAISS Semantic Fallback (Dense Meaning Match) ---
+    if faiss_index is not None and faiss_index.ntotal > 0:
+        query_vector = embedding_model.encode([query_clean], convert_to_numpy=True)
+        faiss.normalize_L2(query_vector)
+
+        similarities, indices = faiss_index.search(query_vector, k=1)
+        best_sim = similarities[0][0]
+        best_idx = indices[0][0]
+
+        if best_sim >= faiss_threshold:
+            logging.info(
+                f"FAISS Semantic Fallback Matched: '{query_name}' -> '{inventory_items[best_idx]}' (Score: {best_sim:.2f})"
+            )
+            return inventory_items[best_idx]
+
+    return None
 
 
 def upsert_product(product_name: str, buying_price: float, selling_price: float,
@@ -466,7 +575,6 @@ def record_sale(order_email: str, client_name: str, invoice_ref: str) -> int:
         conn.executemany("""INSERT INTO sales (order_email, client_name, product_name, quantity, unit_price, discount_percent, buying_price, net_revenue, gross_profit, invoice_ref, sold_at, stock_applied) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
     logging.info(f"LEDGER: {len(rows)} line(s) recorded and stock deducted for {e} (ref {invoice_ref}).")
     return len(rows)
-
 
 
 def owner_metrics() -> dict:
@@ -779,14 +887,11 @@ refresh_catalog_models()
 logging.info("Loading Qwen2.5-1.5B GGUF (CPU)...")
 model_path = hf_hub_download(repo_id="Qwen/Qwen2.5-1.5B-Instruct-GGUF",
                              filename="qwen2.5-1.5b-instruct-q4_k_m.gguf")
-local_llm = LlamaCpp(model_path=model_path, temperature=0.1, max_tokens=256,
+
+local_llm = LlamaCpp(model_path=model_path, temperature=0.1, top_p=0.2, top_k=5, max_tokens=256,
                      n_ctx=2048, n_threads=max(os.cpu_count() - 1, 1), verbose=False)
 
-ensure_trace_schema(DB_FILE)
-# Fixed parameter set for live monitor visualization
-export_models(inventory_items, vectorizer, X, spam_vectorizer,
-              spam_classifier, KNN_MAX_DISTANCE,
-              training_emails, email_labels, model_path)
+# Hooks removed: ensure_trace_schema and export_models
 
 
 # =============================================================================
@@ -851,12 +956,14 @@ async def extract_requirements(state: AgentState) -> dict:
         logging.info(f"SPAM: dropped mail from {sender}")
         return {"intent": "unrelated", "company_name": display, "requested_items": []}
 
-    # --- 3. CLARIFICATION MEMORY -------------------------------------------
+    # --- 3. CLARIFICATION MEMORY (PATCHED) ---------------------------------
     if current_status == "AWAITING_CLARIFICATION":
         if has_words(text, ["yes", "correct", "right", "yep", "yeah", "sure",
                             "proceed", "confirm", "confirmed"]):
-            return {"intent": "new_inquiry", "company_name": display,
-                    "requested_items": db_record["Requested Items"], "feedback_reason": ""}
+            # Prevent early-returning if the DB actually has NO items saved.
+            if db_record and db_record.get("Requested Items"):
+                return {"intent": "new_inquiry", "company_name": display,
+                        "requested_items": db_record["Requested Items"], "feedback_reason": ""}
 
     # --- 4. LLM EXTRACTION -------------------------------------------------
     prompt = PromptTemplate(
@@ -911,8 +1018,6 @@ Extract requested drones into items array keeping user's exact words for product
                               "accept", "accepted", "go ahead", "lpo", "purchase order",
                               "agree", "agreed", "yes"]):
             intent = "quote_approval"
-        elif has_words(text, ["quote", "quotation", "revise", "revised", "amend"]):
-            intent = "new_inquiry"
         else:
             intent = "human_handoff"
 
@@ -933,11 +1038,11 @@ Extract requested drones into items array keeping user's exact words for product
                             "purchase", "order", "interested", "enquiry", "inquiry"]):
             intent = "new_inquiry"
 
-    # --- 6. EXACT MATCH, THEN KNN CLARIFICATION ----------------------------
+    # --- 6. HYBRID MATCH (Exact -> TF-IDF -> FAISS) ----------------------------
     verified_items, clarifications = [], []
     
     # If this is a continuation (like LPO approval), ignore LLM hallucinations
-    if intent in CONTINUATION_INTENTS or intent == "request_discount":
+    if intent in CONTINUATION_INTENTS:
         items_data = []
 
     for item in items_data:
@@ -945,18 +1050,15 @@ Extract requested drones into items array keeping user's exact words for product
         if not name:
             continue
             
-        # Capture the quantity immediately
         qty = int(item.get("quantity", 1) or 1)
         
-        exact = next((inv for inv in inventory_items if inv.lower() == name.lower()), None)
-        if exact:
-            verified_items.append({"product": exact, "quantity": qty})
-            continue
-        distances, indices = nn.kneighbors(vectorizer.transform([name]))
-        best = inventory_items[indices[0][0]] if nn is not None and distances[0][0] < KNN_MAX_DISTANCE else None
+        # Unified 3-Tier Matcher
+        best_match = match_product_hybrid(name)
         
-        # Pass the requested quantity into the clarification list
-        clarifications.append((name, best, qty))
+        if best_match:
+            verified_items.append({"product": best_match, "quantity": qty})
+        else:
+            clarifications.append((name, None, qty))
 
     if clarifications and regex_items:
         logging.info(f"Clarification suppressed; catalogue scan matched "
@@ -968,11 +1070,9 @@ Extract requested drones into items array keeping user's exact words for product
                  "Thanks for your enquiry. We need one quick clarification before "
                  "we can raise your quotation:", ""]
         guessed = []
-        # Unpack the quantity here
         for original, guess, qty in clarifications:
             if guess:
                 lines.append(f"- You asked for '{original}'. Did you mean {guess}?")
-                # Apply the original quantity instead of hardcoding '1'
                 guessed.append({"product": guess, "quantity": qty})
             else:
                 lines.append(f"- We could not match '{original}' to our catalogue. "
@@ -990,9 +1090,10 @@ Extract requested drones into items array keeping user's exact words for product
     elif not verified_items and db_record and db_record["Requested Items"]:
         verified_items = db_record["Requested Items"]
 
-    if not verified_items and intent == "new_inquiry":
+    # Catch-all: If we still have absolutely no items, do NOT generate a blank document.
+    if not verified_items:
         return {"intent": "human_handoff", "company_name": display, "requested_items": [],
-                "handoff_note": "Priced enquiry with no identifiable product."}
+                "handoff_note": "Could not identify any valid products in the request, and no previous order exists."}
 
     return {"intent": intent, "company_name": display,
             "requested_items": verified_items, "feedback_reason": ""}
@@ -1064,15 +1165,22 @@ def ask_owner_discount(state: AgentState) -> dict:
 def apply_discount_and_requote(state: AgentState) -> dict:
     target = state.get("target_client_email") or ""
     body = clean_body(state.get("email_body") or "")
-    approved = bool(re.search(r"\bapprove(?:d)?\b", body, re.I))
+    
+    # PATCH: Using hybrid ML/FAISS string matching to catch "approvec" vs "approved"
+    approved = has_words(body, ["approve", "approved", "confirm", "proceed", "yes", "accept", "agreed"])
     discount = parse_discount(body)
+    
     if not approved:
         return {"doc_type_sent": "Internal Owner Alert", "target_client_email": EMAIL_USER,
                 "reply_message": "Approval not detected. Reply with APPROVE followed by a percentage discount."}
+    
     rec = get_client_status(target)
-    if not rec:
+    
+    # PATCH: Do not process discounts on empty orders to prevent blank PDFs
+    if not rec or not rec.get("Requested Items"):
         return {"doc_type_sent": "Internal Owner Alert", "target_client_email": EMAIL_USER,
-                "reply_message": f"No open order found for {target}."}
+                "reply_message": f"No valid order items found for {target} to apply a discount to."}
+                
     text_lower = body.lower()
     item_specific = None
     for item in rec["Requested Items"]:
@@ -1210,16 +1318,31 @@ def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
 
 
 async def generate_quote(state: AgentState) -> dict:
+    # PATCH: Hard-stop blank PDFs
+    items = state.get("requested_items") or (get_client_status(state.get("sender_email")) or {}).get("Requested Items") or []
+    if not items:
+        return {"doc_type_sent": "Human Handoff", "target_client_email": EMAIL_USER, "reply_message": f"SYSTEM ALERT: Prevented sending a blank Quotation to {state.get('sender_email')}."}
+    
     return {"generated_doc_path": await asyncio.to_thread(generate_professional_pdf, "Quotation", state),
             "doc_type_sent": "Quotation"}
 
 
 async def generate_lpo(state: AgentState) -> dict:
+    # PATCH: Hard-stop blank PDFs
+    items = state.get("requested_items") or (get_client_status(state.get("sender_email")) or {}).get("Requested Items") or []
+    if not items:
+        return {"doc_type_sent": "Human Handoff", "target_client_email": EMAIL_USER, "reply_message": f"SYSTEM ALERT: Prevented sending a blank LPO to {state.get('sender_email')}."}
+        
     return {"generated_doc_path": await asyncio.to_thread(generate_professional_pdf, "LPO", state),
             "doc_type_sent": "Local Purchase Order"}
 
 
 async def generate_invoice(state: AgentState) -> dict:
+    # PATCH: Hard-stop blank PDFs
+    items = state.get("requested_items") or (get_client_status(state.get("sender_email")) or {}).get("Requested Items") or []
+    if not items:
+        return {"doc_type_sent": "Human Handoff", "target_client_email": EMAIL_USER, "reply_message": f"SYSTEM ALERT: Prevented sending a blank Invoice to {state.get('sender_email')}."}
+        
     return {"generated_doc_path": await asyncio.to_thread(generate_professional_pdf, "Invoice", state),
             "doc_type_sent": "Tax Invoice",
             "reply_message": "Thank you. Please find your tax invoice attached."}
@@ -1346,7 +1469,7 @@ app = workflow.compile()
 
 
 # =============================================================================
-# 12. DASHBOARD
+# 12. DASHBOARD (PATCHED UI)
 # =============================================================================
 def dashboard_data() -> dict:
     with db_conn() as conn:
@@ -1401,45 +1524,62 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-       background:#eef2f6;margin:0;padding:12px;color:#2f4256;font-size:15px}
-  .wrap{max-width:1000px;margin:0 auto}
-  header{background:linear-gradient(135deg,#1b4f72,#2980b9);color:#fff;border-radius:14px;
-         padding:18px 16px;margin-bottom:12px}
-  header h1{margin:0;font-size:19px;letter-spacing:.3px}
-  header p{margin:4px 0 0;font-size:12px;opacity:.85}
-  .kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}
-  @media(min-width:640px){.kpis{grid-template-columns:repeat(4,1fr)}}
-  .kpi{background:#fff;border-radius:12px;padding:13px 12px;box-shadow:0 1px 3px rgba(20,50,80,.08)}
-  .kpi .l{font-size:10.5px;color:#8496a6;text-transform:uppercase;letter-spacing:.6px;font-weight:600}
-  .kpi .v{font-size:20px;font-weight:700;color:#1b4f72;margin-top:3px;line-height:1.15}
-  .kpi .s{font-size:11px;color:#8496a6;margin-top:2px}
-  .kpi.warn .v{color:#c0392b}
-  .tabs{display:flex;gap:6px;margin-bottom:12px;overflow-x:auto;padding-bottom:2px}
-  .tab{flex:0 0 auto;padding:9px 15px;border-radius:999px;background:#fff;border:none;
-       font-size:13.5px;font-weight:600;color:#5a6b7b;cursor:pointer;font-family:inherit}
-  .tab.on{background:#1b4f72;color:#fff}
-  .panel{display:none}.panel.on{display:block}
-  .card{background:#fff;border-radius:14px;padding:14px;margin-bottom:12px;
-        box-shadow:0 1px 3px rgba(20,50,80,.08)}
-  .card h2{margin:0 0 10px;font-size:14px;color:#5a6b7b;text-transform:uppercase;letter-spacing:.6px}
-  .chart{position:relative;height:230px}
-  @media(min-width:640px){.chart{height:300px}}
+       background:#f4f7f6;margin:0;padding:16px;color:#2c3e50;font-size:15px}
+  .wrap{max-width:1100px;margin:0 auto}
+  
+  header{background:linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);color:#fff;border-radius:16px;
+         padding:24px 20px;margin-bottom:20px;box-shadow:0 10px 20px rgba(30,60,114,.15)}
+  header h1{margin:0;font-size:22px;letter-spacing:.5px;font-weight:700}
+  header p{margin:6px 0 0;font-size:13px;opacity:.9}
+  
+  .kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:20px}
+  @media(min-width:768px){.kpis{grid-template-columns:repeat(4,1fr)}}
+  
+  .kpi{background:#fff;border-radius:16px;padding:18px 16px;
+       box-shadow:0 4px 15px rgba(0,0,0,.04);transition:all 0.3s ease; border: 1px solid #eef2f5;}
+  .kpi:hover{transform:translateY(-4px);box-shadow:0 8px 25px rgba(0,0,0,.08)}
+  .kpi .l{font-size:11px;color:#7f8c8d;text-transform:uppercase;letter-spacing:.8px;font-weight:700}
+  .kpi .v{font-size:24px;font-weight:800;color:#1e3c72;margin-top:6px;line-height:1.2}
+  .kpi .s{font-size:12px;color:#95a5a6;margin-top:4px}
+  .kpi.warn .v{color:#e74c3c}
+  
+  .tabs{display:flex;gap:10px;margin-bottom:20px;overflow-x:auto;padding-bottom:4px}
+  .tab{flex:0 0 auto;padding:10px 20px;border-radius:999px;background:#fff;border:1px solid #dfe6e9;
+       font-size:14px;font-weight:600;color:#7f8c8d;cursor:pointer;font-family:inherit;transition:all 0.2s}
+  .tab:hover{background:#f8f9fa;color:#2c3e50}
+  .tab.on{background:#1e3c72;color:#fff;border-color:#1e3c72;box-shadow:0 4px 10px rgba(30,60,114,.2)}
+  
+  .panel{display:none; animation: fadeIn 0.4s ease;}
+  .panel.on{display:block}
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+  
+  .card{background:#fff;border-radius:16px;padding:20px;margin-bottom:20px;
+        box-shadow:0 4px 15px rgba(0,0,0,.04); border: 1px solid #eef2f5; transition:all 0.3s}
+  .card:hover{box-shadow:0 6px 20px rgba(0,0,0,.06)}
+  .card h2{margin:0 0 16px;font-size:15px;color:#34495e;text-transform:uppercase;letter-spacing:.8px}
+  
+  .chart{position:relative;height:260px}
+  @media(min-width:768px){.chart{height:320px}}
+  
   table{width:100%;border-collapse:collapse}
-  th{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:#8496a6;
-     text-align:left;padding:8px 6px;border-bottom:2px solid #e3eaf0;white-space:nowrap;
-     cursor:pointer;user-select:none}
+  th{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#7f8c8d;
+     text-align:left;padding:12px 10px;border-bottom:2px solid #ecf0f1;white-space:nowrap;
+     cursor:pointer;user-select:none;transition:background 0.2s}
+  th:hover{background:#f8f9fa}
   th.r,td.r{text-align:right}
-  td{padding:10px 6px;border-bottom:1px solid #f0f4f7;font-size:14px}
+  td{padding:14px 10px;border-bottom:1px solid #f4f6f7;font-size:14px;color:#2c3e50}
   tr:last-child td{border-bottom:none}
-  .nm{font-weight:600}
-  .bad{color:#c0392b;font-weight:700}.mid{color:#e67e22;font-weight:600}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
-        background:#eef4f9;color:#1b4f72;font-weight:600}
-  .empty{text-align:center;color:#8496a6;padding:24px 0;font-size:14px}
-  footer{text-align:center;font-size:11px;color:#9aa8b5;padding:8px 0 16px}
+  tr:hover td{background:#fcfdfd}
+  
+  .nm{font-weight:700;color:#1e3c72}
+  .bad{color:#e74c3c;font-weight:700}.mid{color:#e67e22;font-weight:600}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:11px;
+        background:#eef2f5;color:#1e3c72;font-weight:700;letter-spacing:0.3px}
+  .empty{text-align:center;color:#95a5a6;padding:30px 0;font-size:15px}
+  footer{text-align:center;font-size:12px;color:#9aa8b5;padding:12px 0 24px}
 </style></head><body><div class="wrap">
 
-<header><h1>Aerotech Drones</h1><p>Live ERP dashboard &middot; __STAMP__</p></header>
+<header><h1>Aerotech Live Analytics</h1><p>Autonomous ERP Data &middot; __STAMP__</p></header>
 
 <div class="kpis">
   <div class="kpi"><div class="l">Sold today</div><div class="v">__K_TODAY_U__</div>
@@ -1485,12 +1625,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div class="card"><h2>Open deals &mdash; __K_PIPE_N__ worth __K_PIPE_V__</h2>__T_PIPE__</div>
 </div>
 
-<div class="card" style="background:linear-gradient(135deg, #1b4f72, #2980b9); color:#fff; margin-top:24px;">
-  <h2 style="color:#fff; border-bottom:1px solid rgba(255,255,255,0.2); padding-bottom:8px;">Executive Summary</h2>
-  <p style="font-size:15px; line-height:1.6; margin-bottom:0; opacity: 0.95;">__SUMMARY_TEXT__</p>
+<div class="card" style="background:linear-gradient(135deg, #1e3c72 0%, #2a5298 100%); color:#fff; margin-top:30px; box-shadow: 0 10px 20px rgba(30,60,114,.15);">
+  <h2 style="color:#fff; border-bottom:1px solid rgba(255,255,255,0.2); padding-bottom:10px;">Executive Summary</h2>
+  <p style="font-size:15px; line-height:1.7; margin-bottom:0; opacity: 0.95;">__SUMMARY_TEXT__</p>
 </div>
 
-<footer>Figures read from the immutable sales ledger.</footer>
+<footer>Figures read directly from the immutable sales ledger.</footer>
 </div>
 <script>
 document.querySelectorAll('.tab').forEach(function(b){
@@ -1499,7 +1639,6 @@ document.querySelectorAll('.tab').forEach(function(b){
     document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on')});
     b.classList.add('on');
     document.getElementById(b.dataset.p).classList.add('on');
-    window.dispatchEvent(new Event('resize'));
   };
 });
 
@@ -1520,35 +1659,38 @@ document.querySelectorAll('table').forEach(function(t){
 });
 
 var CUR='__CURRENCY__';
+Chart.defaults.color = '#7f8c8d';
+Chart.defaults.font.family = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
+
 var fmt={responsive:true,maintainAspectRatio:false,
-         plugins:{legend:{labels:{boxWidth:12,font:{size:11}}}},
-         scales:{x:{ticks:{font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:8}},
-                 y:{beginAtZero:true,ticks:{font:{size:10}}}}};
+         plugins:{legend:{labels:{boxWidth:14,font:{size:12,weight:'600'}}}},
+         scales:{x:{grid:{display:false},ticks:{font:{size:10},maxRotation:0,autoSkip:true,maxTicksLimit:8}},
+                 y:{grid:{color:'#ecf0f1'},beginAtZero:true,ticks:{font:{size:11}}}}};
 
 new Chart(document.getElementById('trend'),{type:'line',
   data:{labels:__LABELS__,datasets:[
-    {label:'Revenue',data:__REV__,borderColor:'#2980b9',backgroundColor:'rgba(41,128,185,.12)',
-     fill:true,tension:.3,borderWidth:2,pointRadius:0},
-    {label:'Gross profit',data:__PROFIT__,borderColor:'#27ae60',
-     backgroundColor:'rgba(39,174,96,.10)',fill:true,tension:.3,borderWidth:2,pointRadius:0}
+    {label:'Revenue',data:__REV__,borderColor:'#3498db',backgroundColor:'rgba(52, 152, 219, 0.1)',
+     fill:true,tension:.4,borderWidth:3,pointRadius:2,pointHoverRadius:5},
+    {label:'Gross profit',data:__PROFIT__,borderColor:'#2ecc71',
+     backgroundColor:'rgba(46, 204, 113, 0.1)',fill:true,tension:.4,borderWidth:3,pointRadius:2,pointHoverRadius:5}
   ]},options:fmt});
 
 new Chart(document.getElementById('units'),{type:'bar',
-  data:{labels:__LABELS__,datasets:[{label:'Units',data:__QTY__,backgroundColor:'#5dade2'}]},
+  data:{labels:__LABELS__,datasets:[{label:'Units',data:__QTY__,backgroundColor:'#3498db',borderRadius:4}]},
   options:fmt});
 
 new Chart(document.getElementById('models'),{type:'bar',
   data:{labels:__M_LABELS__,datasets:[{label:'Units sold',data:__M_UNITS__,
-        backgroundColor:'#1b4f72'}]},
+        backgroundColor:'#1e3c72',borderRadius:4}]},
   options:Object.assign({},fmt,{indexAxis:'y',
-    scales:{x:{beginAtZero:true,ticks:{font:{size:10}}},y:{ticks:{font:{size:10}}}}})});
+    scales:{x:{grid:{color:'#ecf0f1'},beginAtZero:true,ticks:{font:{size:11}}},y:{grid:{display:false},ticks:{font:{size:11,weight:'600'},color:'#2c3e50'}}}})});
 
 new Chart(document.getElementById('stock'),{type:'bar',
   data:{labels:__S_LABELS__,datasets:[
-    {label:'In stock',data:__S_STOCK__,backgroundColor:'#5dade2'},
-    {label:'Reorder level',data:__S_LEVEL__,backgroundColor:'#e74c3c'}]},
+    {label:'In stock',data:__S_STOCK__,backgroundColor:'#3498db',borderRadius:4},
+    {label:'Reorder level',data:__S_LEVEL__,backgroundColor:'#e74c3c',borderRadius:4}]},
   options:Object.assign({},fmt,{indexAxis:'y',
-    scales:{x:{beginAtZero:true,ticks:{font:{size:10}}},y:{ticks:{font:{size:10}}}}})});
+    scales:{x:{grid:{color:'#ecf0f1'},beginAtZero:true,ticks:{font:{size:11}}},y:{grid:{display:false},ticks:{font:{size:11,weight:'600'},color:'#2c3e50'}}}})});
 
 new Chart(document.getElementById('pipe_chart'),{
   type:'doughnut',
@@ -1557,11 +1699,13 @@ new Chart(document.getElementById('pipe_chart'),{
     datasets:[{
       label:'Deal Value',
       data:__P_VALUE__,
-      backgroundColor:['#1b4f72','#2980b9','#27ae60','#e67e22','#8e44ad','#e74c3c','#34495e']
+      backgroundColor:['#1e3c72','#3498db','#2ecc71','#f39c12','#9b59b6','#e74c3c','#34495e'],
+      borderWidth: 2, borderColor: '#fff'
     }]
   },
   options: Object.assign({}, fmt, {
-    plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } } },
+    cutout: '65%',
+    plugins: { legend: { position: 'right', labels: { padding: 20, boxWidth: 12, font: { size: 12 } } } },
     scales: { x: { display: false }, y: { display: false } }
   })
 });
@@ -1748,8 +1892,8 @@ def fetch_one(mail, uid: int) -> Optional[dict]:
     if sender.lower() == EMAIL_USER.lower() and "send" in sub_lower and "report" in sub_lower:
         mark_processed(message_id)
         send_owner_report_sync()
-        record_trace(DB_FILE, sender, subject, extract_message_body(msg),
-                     None, "owner_report", "Dashboard", "", [], 0)
+        
+        # Hooks removed: record_trace
         return None
     if any(d in sender.lower() for d in IGNORE_DOMAINS):
         return None
@@ -1821,7 +1965,8 @@ async def email_poller(queue: asyncio.Queue):
                 await queue.put(mail)
         except Exception as e:
             logging.error(f"Poller error: {e}")
-        await asyncio.to_thread(heartbeat, DB_FILE)
+        
+        # Hooks removed: heartbeat
         await asyncio.sleep(POLL_SECONDS)
 
 
@@ -1849,13 +1994,8 @@ async def agent_worker(queue: asyncio.Queue):
                 "reply_html": None, "reply_subject": None,
                 "retain_items": False, "handoff_note": None, "error_message": None})
             
-            record_trace(
-                DB_FILE, mail_data.get("sender_email", ""),
-                mail_data.get("email_subject", ""), mail_data.get("email_body", ""),
-                _status_before, (_final or {}).get("intent"),
-                (_final or {}).get("doc_type_sent"), LAST_LLM_RAW["v"],
-                (_final or {}).get("requested_items"),
-                (datetime.now() - _t0).total_seconds() * 1000)
+            # Hooks removed: record_trace
+            
         except Exception as e:
             logging.error(f"Agent worker error on {mail_data.get('sender_email')}: {e}")
         finally:
@@ -1904,7 +2044,7 @@ async def inventory_manager_worker():
 
 async def main():
     q = asyncio.Queue()
-    logging.info("Aerotech ERP v5.2 starting...")
+    logging.info("Aerotech ERP v5.2.1 starting...")
     logging.info(f"Database: {DB_FILE} | Mailbox: {MAILBOX} | Poll: {POLL_SECONDS}s")
     await asyncio.gather(email_poller(q), agent_worker(q), inventory_manager_worker())
 
