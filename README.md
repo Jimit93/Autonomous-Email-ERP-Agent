@@ -4,7 +4,7 @@
 
 ## 📋 Description
 
-AI-powered Email-to-ERP automation system. Processes customer emails, classifies intent, matches products, verifies inventory, generates PDF quotes/invoices, manages sales pipeline, and tracks profitability—all autonomously. Combines Qwen LLM with ML classifiers (intent, spam) for robust natural language understanding. Admin approves discounts & bulk orders via email. Includes real-time dashboard with charts.
+AI-powered Email-to-ERP automation system. Processes customer emails, classifies intent, matches products, verifies inventory, generates PDF quotes/invoices, manages sales pipeline, and tracks prof[...] 
 
 ---
 
@@ -67,6 +67,19 @@ if "quote" in email and "Mavic" in email:
 | **PDF** | WeasyPrint |
 | **Dashboard** | Chart.js + HTML/CSS |
 | **Async** | asyncio |
+
+
+### Lightweight & Local-first
+
+Autonomous-Email-ERP-Agent is designed to run smoothly and accurately on low-end PCs with zero cloud cost. It achieves this by combining compact, on-device ML models with FAISS-powered vector search for fast, memory-efficient retrieval. The result is a private, responsive agent that works on consumer hardware without relying on paid cloud inference.
+
+Key optimizations:
+- FAISS approximate indexing (IVF + PQ) and memory-mapped indexes
+- Small/distilled models and quantized weights for fast on-device inference
+- ONNX/CPU-optimized runtimes and multi-threading
+- Incremental/background indexing and batched queries to preserve responsiveness
+
+Clarification: “zero cloud cost” means no paid cloud inference or storage — local compute still consumes electricity and hardware resources.
 
 
 
